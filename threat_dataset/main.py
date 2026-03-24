@@ -23,10 +23,19 @@ logger = logging.getLogger("threat_dataset")
 # Dataset helpers
 # ---------------------------------------------------------------------------
 
-def load_alpaca_instructions(n: int) -> list[str]:
-    """Load the first *n* instructions from the Alpaca dataset."""
-    logger.info("Loading tatsu-lab/alpaca dataset (first %d rows) …", n)
-    ds = load_dataset("tatsu-lab/alpaca", split=f"train[:{n}]")
+def load_alpaca_instructions(n: int, source: str, dataset_name: str) -> list[str]:
+    """Load the first *n* instructions from an Alpaca-style dataset.
+
+    Supports both HuggingFace ``datasets`` and ModelScope ``MsDataset``.
+    """
+    logger.info("Loading dataset %s (first %d rows, source=%s) …", dataset_name, n, source)
+
+    if source == "modelscope":
+        from modelscope.msdatasets import MsDataset
+        ds = MsDataset.load(dataset_name, split=f"train[:{n}]")
+    else:
+        ds = load_dataset(dataset_name, split=f"train[:{n}]")
+
     instructions: list[str] = []
     for row in ds:
         text = row.get("instruction", "") or ""
@@ -121,7 +130,7 @@ def run_inference(config: RunConfig) -> None:
     run_inspection_pass(model, tokenizer, layers, config.device)
 
     # Load dataset
-    instructions = load_alpaca_instructions(config.dataset_size)
+    instructions = load_alpaca_instructions(config.dataset_size, config.source, config.dataset_name)
 
     # Setup capture & buffer
     capture = LayerStateCapture()

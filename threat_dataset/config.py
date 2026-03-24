@@ -43,6 +43,12 @@ DEFAULT_BUFFER_FLUSH_SIZE = 10_000
 DEFAULT_DATASET_SIZE = 5000
 DEFAULT_OUTPUT_DIR = "output"
 
+# Default dataset names per source
+DEFAULT_DATASET_NAMES = {
+    "huggingface": "tatsu-lab/alpaca",
+    "modelscope": "AI-ModelScope/alpaca-gpt4-data-en",
+}
+
 # Known decoder-layer attribute paths (tried in order)
 LAYER_ATTR_PATHS = ["model.layers", "layers"]
 
@@ -61,6 +67,7 @@ class RunConfig:
     log_dir: str
     source: str  # "huggingface" or "modelscope"
     step: str  # "download", "inference", or "all"
+    dataset_name: str  # dataset identifier (e.g. "tatsu-lab/alpaca")
 
     @property
     def short_model_name(self) -> str:
@@ -132,8 +139,17 @@ def parse_args(argv: list[str] | None = None) -> RunConfig:
              "'inference' to run inference (model must already be cached), "
              "'all' to do both (default: all)",
     )
+    p.add_argument(
+        "--dataset-name",
+        type=str,
+        default=None,
+        help="Dataset identifier. Defaults to 'tatsu-lab/alpaca' (huggingface) "
+             "or 'AI-ModelScope/alpaca-gpt4-data-en' (modelscope)",
+    )
 
     args = p.parse_args(argv)
+
+    dataset_name = args.dataset_name or DEFAULT_DATASET_NAMES[args.source]
 
     return RunConfig(
         model_name=args.model,
@@ -145,4 +161,5 @@ def parse_args(argv: list[str] | None = None) -> RunConfig:
         log_dir=args.log_dir,
         source=args.source,
         step=args.step,
+        dataset_name=dataset_name,
     )
