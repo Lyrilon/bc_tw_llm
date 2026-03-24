@@ -50,7 +50,10 @@ pip install -r requirements.txt
 
 ```bash
 # Test with 5 instructions to verify everything works
-python -m threat_dataset --model meta-llama/Meta-Llama-3-8B --dataset-size 5 --step "download"
+python -m threat_dataset --model meta-llama/Meta-Llama-3-8B --dataset-size 5 --step "download" 
+
+# 使用魔塔，注意 model 参数换成了 LLM-Research/Meta-Llama-3-8B
+python -m threat_dataset --model LLM-Research/Meta-Llama-3-8B --dataset-size 5 --step "all" --source "modelscope"
 
 # Or with Qwen
 python -m threat_dataset --model Qwen/Qwen1.5-7B --dataset-size 5 --step "download"

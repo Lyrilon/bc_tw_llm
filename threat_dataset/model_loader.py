@@ -37,6 +37,7 @@ def load_model_and_tokenizer(
             torch_dtype=dtype,
             device_map=config.device,
             trust_remote_code=True,
+            ignore_file_pattern=[r'.*\.pth$', r'original/.*']
         )
         model.config.use_cache = False
         model.eval()
@@ -49,6 +50,7 @@ def load_model_and_tokenizer(
             device_map=config.device,
             output_hidden_states=False,
             trust_remote_code=True,
+            ignore_file_pattern=[r'.*\.pth$', r'original/.*']
         )
         model.config.use_cache = False
         model.eval()
