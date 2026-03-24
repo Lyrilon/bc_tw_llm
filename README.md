@@ -50,10 +50,10 @@ pip install -r requirements.txt
 
 ```bash
 # Test with 5 instructions to verify everything works
-python -m threat_dataset --model meta-llama/Meta-Llama-3-8B --dataset-size 5
+python -m threat_dataset --model meta-llama/Meta-Llama-3-8B --dataset-size 5 --step "download"
 
 # Or with Qwen
-python -m threat_dataset --model Qwen/Qwen1.5-7B --dataset-size 5
+python -m threat_dataset --model Qwen/Qwen1.5-7B --dataset-size 5 --step "download"
 ```
 
 ### 3. Full dataset generation
