@@ -60,6 +60,7 @@ class RunConfig:
     device: str
     log_dir: str
     source: str  # "huggingface" or "modelscope"
+    step: str  # "download", "inference", or "all"
 
     @property
     def short_model_name(self) -> str:
@@ -122,6 +123,15 @@ def parse_args(argv: list[str] | None = None) -> RunConfig:
         default="huggingface",
         help="Model source: huggingface or modelscope (default: huggingface)",
     )
+    p.add_argument(
+        "--step",
+        type=str,
+        choices=["download", "inference", "all"],
+        default="all",
+        help="Run step: 'download' to only download the model, "
+             "'inference' to run inference (model must already be cached), "
+             "'all' to do both (default: all)",
+    )
 
     args = p.parse_args(argv)
 
@@ -134,4 +144,5 @@ def parse_args(argv: list[str] | None = None) -> RunConfig:
         device=args.device,
         log_dir=args.log_dir,
         source=args.source,
+        step=args.step,
     )

@@ -191,10 +191,10 @@ pip install -r requirements.txt
 
 ```bash
 # 用 5 条指令验证流程是否正常
-python -m threat_dataset --model meta-llama/Meta-Llama-3-8B --dataset-size 5
+python -m threat_dataset --model meta-llama/Meta-Llama-3-8B --dataset-size 5 --step "download"
 
 # 使用 Qwen 模型
-python -m threat_dataset --model Qwen/Qwen1.5-7B --dataset-size 5
+python -m threat_dataset --model Qwen/Qwen1.5-7B --dataset-size 5 --step "download"
 ```
 
 ### 3. 完整数据集生成

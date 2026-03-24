@@ -96,11 +96,21 @@ def process_instruction(
 # Main
 # ---------------------------------------------------------------------------
 
-def main(argv: list[str] | None = None) -> None:
-    config = parse_args(argv)
-    setup_logging(config.log_dir)
+def download_model(config: RunConfig) -> None:
+    """Download model and tokenizer to local cache (no inference)."""
+    logger.info("=== Step: Download Model ===")
+    logger.info("Config: %s", config)
 
-    logger.info("=== Threat Activation Dataset Generator ===")
+    model, tokenizer = load_model_and_tokenizer(config)
+    layers, num_layers = discover_layers(model)
+
+    logger.info("=== Download complete. Model cached locally. ===")
+    logger.info("Layers discovered: %d. Run with --step inference to generate dataset.", num_layers)
+
+
+def run_inference(config: RunConfig) -> None:
+    """Load a cached model and run inference to generate the dataset."""
+    logger.info("=== Step: Inference ===")
     logger.info("Config: %s", config)
 
     # Load model
@@ -166,6 +176,21 @@ def main(argv: list[str] | None = None) -> None:
         len(instructions),
         elapsed,
     )
+
+
+def main(argv: list[str] | None = None) -> None:
+    config = parse_args(argv)
+    setup_logging(config.log_dir)
+
+    logger.info("=== Threat Activation Dataset Generator ===")
+
+    if config.step == "download":
+        download_model(config)
+    elif config.step == "inference":
+        run_inference(config)
+    else:  # "all"
+        download_model(config)
+        run_inference(config)
 
 
 if __name__ == "__main__":
