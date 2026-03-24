@@ -1,7 +1,8 @@
 """CLI entry-point and main orchestration loop."""
 
 from __future__ import annotations
-
+import os
+import json
 import logging
 import sys
 import time
@@ -15,6 +16,7 @@ from .hooks import LayerStateCapture, register_all_hooks, remove_all_hooks
 from .logging_setup import setup_logging
 from .model_loader import discover_layers, load_model_and_tokenizer, run_inspection_pass
 from .threats import generate_all_threats
+from tqdm import tqdm
 
 logger = logging.getLogger("threat_dataset")
 
@@ -139,14 +141,43 @@ def run_inference(config: RunConfig) -> None:
         output_dir=config.output_dir,
         model_name=config.short_model_name,
     )
-
+    # ---------------------------------------------------------
+    # 新增：断点续传逻辑 (Resume Checkpoint)
+    # ---------------------------------------------------------
+    os.makedirs(config.output_dir, exist_ok=True) # 确保输出文件夹存在
+    progress_file = os.path.join(config.output_dir, "resume_state.json")
+    start_index = 0
+    
+    if os.path.exists(progress_file):
+        try:
+            with open(progress_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+                # 读取最后一次成功处理的 id，下一个就要 +1
+                start_index = state.get("last_instruction_id", -1) + 1 
+            logger.info(">>> 检测到进度文件！将从第 %d 条指令开始断点续传 <<<", start_index)
+        except Exception as e:
+            logger.warning("读取进度文件失败，将从头开始运行: %s", e)
+    # ---------------------------------------------------------
     # Register hooks
     handles = register_all_hooks(layers, capture)
 
     total_records = 0
     t_start = time.time()
     try:
-        for i, text in enumerate(instructions):
+        # 更新 tqdm，让进度条从 start_index 开始，而不是 0
+        pbar = tqdm(
+            enumerate(instructions), 
+            initial=start_index, 
+            total=len(instructions), 
+            desc="Processing instructions", 
+            file=sys.stdout
+        )
+        
+        for i, text in pbar:
+            # 如果当前索引小于记录的开始索引，直接跳过
+            if i < start_index:
+                continue
+
             try:
                 n = process_instruction(
                     instruction_id=i,
@@ -163,9 +194,15 @@ def run_inference(config: RunConfig) -> None:
                 logger.exception("Error processing instruction %d — skipping.", i)
                 continue
 
+            # --- 新增：每次成功处理完，更新小本本 ---
+            with open(progress_file, "w", encoding="utf-8") as f:
+                json.dump({"last_instruction_id": i}, f)
+
             if (i + 1) % 50 == 0 or (i + 1) == len(instructions):
                 elapsed = time.time() - t_start
-                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                # 修正 rate 计算，只算本次运行新处理的指令数
+                processed_this_run = (i + 1) - start_index
+                rate = processed_this_run / elapsed if elapsed > 0 else 0
                 logger.info(
                     "Progress: %d/%d instructions (%.1f instr/s) | %d records | buffer=%d",
                     i + 1,
