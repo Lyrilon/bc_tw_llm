@@ -199,14 +199,16 @@ def _run_classifiers(
 
     # --- Classical ML classifiers (use PCA data) ---
     classical_clfs = _build_classifiers(n_classes)
-    for name, clf in classical_clfs:
-        log.info("Training %s (PCA dim=%d) [%s] …", name, X_train_pca.shape[1], tag)
+    log.info("Starting classical ML classifiers (%d models) [%s]", len(classical_clfs), tag)
+    for i, (name, clf) in enumerate(classical_clfs, 1):
+        log.info("Training %s (%d/%d, PCA dim=%d) [%s] …", name, i, len(classical_clfs), X_train_pca.shape[1], tag)
         t0 = time.time()
         clf.fit(X_train_pca, y_train)
         elapsed = time.time() - t0
         log.info("%s trained in %.1f s", name, elapsed)
 
         # --- val ---
+        log.info("Evaluating %s on validation set...", name)
         m_val, y_pred_val = _evaluate(name, clf, X_val_pca, y_val, class_names, "val")
         m_val["train_time_s"] = elapsed
         m_val["tag"] = tag
@@ -218,6 +220,7 @@ def _run_classifiers(
         )
 
         # --- test ---
+        log.info("Evaluating %s on test set...", name)
         m_test, y_pred_test = _evaluate(name, clf, X_test_pca, y_test, class_names, "test")
         m_test["train_time_s"] = elapsed
         m_test["tag"] = tag
@@ -237,14 +240,16 @@ def _run_classifiers(
 
     # --- Neural Network classifiers (use RAW data, NO PCA) ---
     nn_clfs = build_nn_classifiers()
-    for name, clf in nn_clfs:
-        log.info("Training %s (RAW dim=%d, NO PCA) [%s] …", name, X_train_raw.shape[1], tag)
+    log.info("Starting neural network classifiers (%d models) [%s]", len(nn_clfs), tag)
+    for i, (name, clf) in enumerate(nn_clfs, 1):
+        log.info("Training %s (%d/%d, RAW dim=%d, NO PCA) [%s] …", name, i, len(nn_clfs), X_train_raw.shape[1], tag)
         t0 = time.time()
         clf.fit(X_train_raw, y_train, X_val_raw, y_val)
         elapsed = time.time() - t0
         log.info("%s trained in %.1f s", name, elapsed)
 
         # --- val ---
+        log.info("Evaluating %s on validation set...", name)
         m_val, y_pred_val = _evaluate(name, clf, X_val_raw, y_val, class_names, "val")
         m_val["train_time_s"] = elapsed
         m_val["tag"] = tag
@@ -256,6 +261,7 @@ def _run_classifiers(
         )
 
         # --- test ---
+        log.info("Evaluating %s on test set...", name)
         m_test, y_pred_test = _evaluate(name, clf, X_test_raw, y_test, class_names, "test")
         m_test["train_time_s"] = elapsed
         m_test["tag"] = tag
@@ -286,13 +292,16 @@ def run_cross_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, result
     log.info("=== Task: cross-layer (one model, all layers) ===")
 
     # Extract BOTH raw and PCA features
+    log.info("Extracting raw features (for neural networks)...")
     X_raw, y, class_names, _ = _extract_X_y(df, pca_dim=None)  # NO PCA for neural networks
+    log.info("Extracting PCA features (for classical ML)...")
     X_pca, _, _, _ = _extract_X_y(df, pca_dim=pca_dim)        # PCA for classical ML
 
     log.info("Total samples: %d  raw_features: %d  pca_features: %d  classes: %d",
              len(y), X_raw.shape[1], X_pca.shape[1], len(class_names))
 
     # Use the same stratified split for both (split on labels, which are identical)
+    log.info("Splitting data into train/val/test sets...")
     splits_raw = _split(X_raw, y, val_size, test_size, seed)
     splits_pca = _split(X_pca, y, val_size, test_size, seed)
 
@@ -300,6 +309,7 @@ def run_cross_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, result
     X_train_raw, X_val_raw, X_test_raw, y_train, y_val, y_test = splits_raw
     X_train_pca, X_val_pca, X_test_pca, _, _, _ = splits_pca
 
+    log.info("Starting classifier training and evaluation...")
     return _run_classifiers(
         X_train_pca, X_val_pca, X_test_pca,
         X_train_raw, X_val_raw, X_test_raw,
@@ -321,12 +331,14 @@ def run_per_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, results_
 
     all_metrics: list[dict] = []
 
-    for layer_idx in layers:
+    for i, layer_idx in enumerate(layers, 1):
         layer_df = df[df["layer_index"] == layer_idx]
         tag = f"layer_{layer_idx}"
-        log.info("--- Layer %d: %d samples ---", layer_idx, len(layer_df))
+        log.info("--- Processing layer %d/%d (layer_index=%d): %d samples ---",
+                 i, len(layers), layer_idx, len(layer_df))
 
         # Extract BOTH raw and PCA features
+        log.info("Extracting features for layer %d...", layer_idx)
         X_raw, y, class_names, _ = _extract_X_y(layer_df, pca_dim=None)  # NO PCA for neural networks
         X_pca, _, _, _ = _extract_X_y(layer_df, pca_dim=pca_dim)        # PCA for classical ML
 
@@ -337,6 +349,7 @@ def run_per_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, results_
             continue
 
         # Use the same stratified split for both
+        log.info("Splitting data for layer %d...", layer_idx)
         splits_raw = _split(X_raw, y, val_size, test_size, seed)
         splits_pca = _split(X_pca, y, val_size, test_size, seed)
 
@@ -345,6 +358,7 @@ def run_per_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, results_
 
         layer_dir = results_dir / tag
         layer_dir.mkdir(parents=True, exist_ok=True)
+        log.info("Training classifiers for layer %d...", layer_idx)
         metrics = _run_classifiers(
             X_train_pca, X_val_pca, X_test_pca,
             X_train_raw, X_val_raw, X_test_raw,
@@ -363,6 +377,12 @@ def run_per_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, results_
 
 def run_classification(data_dir, task, pca_dim, val_size, test_size, seed):
     """End-to-end classification pipeline."""
+    log.info("="*70)
+    log.info("Starting classification pipeline")
+    log.info("Task: %s | PCA: %s | Val: %.2f | Test: %.2f | Seed: %d",
+             task, pca_dim if pca_dim else "disabled", val_size, test_size, seed)
+    log.info("="*70)
+
     results_dir = Path(data_dir) / "classify_results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
