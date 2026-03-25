@@ -43,6 +43,8 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
+from .nn_models import build_nn_classifiers
+
 log = logging.getLogger(__name__)
 
 # Threat label definitions (mirrors threat_dataset.config.LABEL_MAP)
@@ -183,23 +185,29 @@ def _save_confusion_matrix(y_true, y_pred, class_names, title, out_path):
 
 
 def _run_classifiers(
-    X_train, y_train, X_val, y_val, X_test, y_test,
+    X_train_pca, X_val_pca, X_test_pca,
+    X_train_raw, X_val_raw, X_test_raw,
+    y_train, y_val, y_test,
     class_names, results_dir: Path, tag: str,
 ):
-    """Train all classifiers, evaluate, save artifacts. Return metrics list."""
+    """Train all classifiers, evaluate, save artifacts. Return metrics list.
+
+    Classical ML uses PCA-reduced data; Neural Networks use raw high-dim data.
+    """
     n_classes = len(class_names)
-    classifiers = _build_classifiers(n_classes)
     all_metrics: list[dict] = []
 
-    for name, clf in classifiers:
-        log.info("Training %s [%s] …", name, tag)
+    # --- Classical ML classifiers (use PCA data) ---
+    classical_clfs = _build_classifiers(n_classes)
+    for name, clf in classical_clfs:
+        log.info("Training %s (PCA dim=%d) [%s] …", name, X_train_pca.shape[1], tag)
         t0 = time.time()
-        clf.fit(X_train, y_train)
+        clf.fit(X_train_pca, y_train)
         elapsed = time.time() - t0
         log.info("%s trained in %.1f s", name, elapsed)
 
         # --- val ---
-        m_val, y_pred_val = _evaluate(name, clf, X_val, y_val, class_names, "val")
+        m_val, y_pred_val = _evaluate(name, clf, X_val_pca, y_val, class_names, "val")
         m_val["train_time_s"] = elapsed
         m_val["tag"] = tag
         all_metrics.append(m_val)
@@ -210,7 +218,45 @@ def _run_classifiers(
         )
 
         # --- test ---
-        m_test, y_pred_test = _evaluate(name, clf, X_test, y_test, class_names, "test")
+        m_test, y_pred_test = _evaluate(name, clf, X_test_pca, y_test, class_names, "test")
+        m_test["train_time_s"] = elapsed
+        m_test["tag"] = tag
+        all_metrics.append(m_test)
+        _save_confusion_matrix(
+            y_test, y_pred_test, class_names,
+            f"{name} — test ({tag})",
+            results_dir / f"cm_{tag}_{name}_test.png",
+        )
+
+        report = classification_report(y_test, y_pred_test, target_names=class_names, zero_division=0)
+        (results_dir / f"report_{tag}_{name}_test.txt").write_text(report)
+        print(f"\n{'='*60}")
+        print(f"  {name} — test report ({tag})")
+        print(f"{'='*60}")
+        print(report)
+
+    # --- Neural Network classifiers (use RAW data, NO PCA) ---
+    nn_clfs = build_nn_classifiers()
+    for name, clf in nn_clfs:
+        log.info("Training %s (RAW dim=%d, NO PCA) [%s] …", name, X_train_raw.shape[1], tag)
+        t0 = time.time()
+        clf.fit(X_train_raw, y_train, X_val_raw, y_val)
+        elapsed = time.time() - t0
+        log.info("%s trained in %.1f s", name, elapsed)
+
+        # --- val ---
+        m_val, y_pred_val = _evaluate(name, clf, X_val_raw, y_val, class_names, "val")
+        m_val["train_time_s"] = elapsed
+        m_val["tag"] = tag
+        all_metrics.append(m_val)
+        _save_confusion_matrix(
+            y_val, y_pred_val, class_names,
+            f"{name} — val ({tag})",
+            results_dir / f"cm_{tag}_{name}_val.png",
+        )
+
+        # --- test ---
+        m_test, y_pred_test = _evaluate(name, clf, X_test_raw, y_test, class_names, "test")
         m_test["train_time_s"] = elapsed
         m_test["tag"] = tag
         all_metrics.append(m_test)
@@ -238,11 +284,28 @@ def _run_classifiers(
 def run_cross_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, results_dir):
     """Single classifier trained on all layers mixed together."""
     log.info("=== Task: cross-layer (one model, all layers) ===")
-    X, y, class_names, _ = _extract_X_y(df, pca_dim)
-    log.info("Total samples: %d  features: %d  classes: %d", *X.shape, len(class_names))
 
-    splits = _split(X, y, val_size, test_size, seed)
-    return _run_classifiers(*splits, class_names, results_dir, tag="cross_layer")
+    # Extract BOTH raw and PCA features
+    X_raw, y, class_names, _ = _extract_X_y(df, pca_dim=None)  # NO PCA for neural networks
+    X_pca, _, _, _ = _extract_X_y(df, pca_dim=pca_dim)        # PCA for classical ML
+
+    log.info("Total samples: %d  raw_features: %d  pca_features: %d  classes: %d",
+             len(y), X_raw.shape[1], X_pca.shape[1], len(class_names))
+
+    # Use the same stratified split for both (split on labels, which are identical)
+    splits_raw = _split(X_raw, y, val_size, test_size, seed)
+    splits_pca = _split(X_pca, y, val_size, test_size, seed)
+
+    # Unpack: train_raw, val_raw, test_raw, y_train, y_val, y_test
+    X_train_raw, X_val_raw, X_test_raw, y_train, y_val, y_test = splits_raw
+    X_train_pca, X_val_pca, X_test_pca, _, _, _ = splits_pca
+
+    return _run_classifiers(
+        X_train_pca, X_val_pca, X_test_pca,
+        X_train_raw, X_val_raw, X_test_raw,
+        y_train, y_val, y_test,
+        class_names, results_dir, tag="cross_layer"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +326,9 @@ def run_per_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, results_
         tag = f"layer_{layer_idx}"
         log.info("--- Layer %d: %d samples ---", layer_idx, len(layer_df))
 
-        X, y, class_names, _ = _extract_X_y(layer_df, pca_dim)
+        # Extract BOTH raw and PCA features
+        X_raw, y, class_names, _ = _extract_X_y(layer_df, pca_dim=None)  # NO PCA for neural networks
+        X_pca, _, _, _ = _extract_X_y(layer_df, pca_dim=pca_dim)        # PCA for classical ML
 
         # Skip if too few samples per class for stratified split
         unique, counts = np.unique(y, return_counts=True)
@@ -271,10 +336,21 @@ def run_per_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, results_
             log.warning("Layer %d: too few samples (min class=%d), skipping", layer_idx, counts.min())
             continue
 
-        splits = _split(X, y, val_size, test_size, seed)
+        # Use the same stratified split for both
+        splits_raw = _split(X_raw, y, val_size, test_size, seed)
+        splits_pca = _split(X_pca, y, val_size, test_size, seed)
+
+        X_train_raw, X_val_raw, X_test_raw, y_train, y_val, y_test = splits_raw
+        X_train_pca, X_val_pca, X_test_pca, _, _, _ = splits_pca
+
         layer_dir = results_dir / tag
         layer_dir.mkdir(parents=True, exist_ok=True)
-        metrics = _run_classifiers(*splits, class_names, layer_dir, tag=tag)
+        metrics = _run_classifiers(
+            X_train_pca, X_val_pca, X_test_pca,
+            X_train_raw, X_val_raw, X_test_raw,
+            y_train, y_val, y_test,
+            class_names, layer_dir, tag=tag
+        )
         all_metrics.extend(metrics)
 
     return all_metrics
@@ -317,7 +393,8 @@ def run_classification(data_dir, task, pca_dim, val_size, test_size, seed):
 
 def parse_classify_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Classify threat types from hidden-state vectors with classical ML.",
+        description="Classify threat types from hidden-state vectors. "
+                    "Classical ML uses PCA-reduced features; Neural Networks use raw features (NO PCA).",
     )
     p.add_argument(
         "--data-dir", type=str, default="output",
@@ -330,7 +407,8 @@ def parse_classify_args(argv=None):
     )
     p.add_argument(
         "--pca-dim", type=int, default=128,
-        help="PCA components for dimensionality reduction (default: 128, 0 to disable)",
+        help="PCA components for classical ML classifiers (default: 128, 0 to disable). "
+             "NOTE: Neural Networks (MLP) always use raw features WITHOUT PCA.",
     )
     p.add_argument(
         "--val-size", type=float, default=0.15,
