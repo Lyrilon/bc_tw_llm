@@ -397,7 +397,7 @@ def parse_classify_args(argv=None):
                     "Classical ML uses PCA-reduced features; Neural Networks use raw features (NO PCA).",
     )
     p.add_argument(
-        "--data-dir", type=str, default="output",
+        "--data-dir", type=str, default="/root/autodl-tmp/data/",
         help="Directory containing .parquet data files (default: output)",
     )
     p.add_argument(

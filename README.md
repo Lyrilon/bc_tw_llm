@@ -245,24 +245,20 @@ python -m classify [OPTIONS]
 ```bash
 # 1. Cross-layer classification (default) with PCA
 python -m classify \
-    --data-dir output \
     --task cross-layer \
     --pca-dim 128
 
 # 2. Per-layer classification (train 32 separate models for 32 layers)
 python -m classify \
-    --data-dir output \
     --task per-layer \
     --pca-dim 128
 
 # 3. No PCA (use full 4096-dim vectors)
 python -m classify \
-    --data-dir output \
     --pca-dim 0
 
 # 4. Custom split ratios
 python -m classify \
-    --data-dir output \
     --val-size 0.1 \
     --test-size 0.2 \
     --seed 123
