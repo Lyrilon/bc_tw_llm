@@ -67,7 +67,7 @@ def load_data(data_dir: str) -> pd.DataFrame:
     files = sorted(p.glob("*.parquet"))
     if not files:
         raise FileNotFoundError(f"No .parquet files found in {data_dir}")
-    df = pd.read_parquet(p)
+    df = pd.read_parquet(files)
     log.info("Loaded %d records from %d file(s) in %s", len(df), len(files), data_dir)
     return df
 
