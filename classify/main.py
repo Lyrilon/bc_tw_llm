@@ -43,7 +43,8 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
-from .nn_models import build_nn_classifiers
+from .nn_models import build_nn_classifiers, NNClassifier, NN_CONFIGS, CachedParquetDataset
+from .sampling import stratified_sample
 from .logging_setup import setup_logging
 
 log = logging.getLogger("classify")
@@ -336,14 +337,21 @@ def run_cross_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, result
     log.info("Total samples: %d  raw_features: %d  pca_features: %d  classes: %d",
              len(y), X_raw.shape[1], X_pca.shape[1], len(class_names))
 
-    # Use the same stratified split for both (split on labels, which are identical)
+    # Split once using indices, then apply to both matrices
     log.info("Splitting data into train/val/test sets...")
-    splits_raw = _split(X_raw, y, val_size, test_size, seed)
-    splits_pca = _split(X_pca, y, val_size, test_size, seed)
+    idx_tv, idx_test = train_test_split(
+        np.arange(len(y)), test_size=test_size, random_state=seed, stratify=y
+    )
+    relative_val = val_size / (1 - test_size)
+    idx_train, idx_val = train_test_split(
+        idx_tv, test_size=relative_val, random_state=seed, stratify=y[idx_tv]
+    )
 
-    # Unpack: train_raw, val_raw, test_raw, y_train, y_val, y_test
-    X_train_raw, X_val_raw, X_test_raw, y_train, y_val, y_test = splits_raw
-    X_train_pca, X_val_pca, X_test_pca, _, _, _ = splits_pca
+    X_train_raw, X_val_raw, X_test_raw = X_raw[idx_train], X_raw[idx_val], X_raw[idx_test]
+    X_train_pca, X_val_pca, X_test_pca = X_pca[idx_train], X_pca[idx_val], X_pca[idx_test]
+    y_train, y_val, y_test = y[idx_train], y[idx_val], y[idx_test]
+
+    log.info("Split — train: %d  val: %d  test: %d", len(y_train), len(y_val), len(y_test))
 
     log.info("Starting classifier training and evaluation...")
     return _run_classifiers(
@@ -407,32 +415,164 @@ def run_per_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, results_
 
 
 # ---------------------------------------------------------------------------
+# Track 2: Streaming Neural Network pipeline (full data, no PCA)
+# ---------------------------------------------------------------------------
+
+
+def run_nn_streaming(data_dir: str, task: str, val_size: float, test_size: float,
+                     seed: int, results_dir: Path, nn_kwargs: dict):
+    """Train neural networks on full-resolution data via streaming DataLoaders.
+
+    This avoids loading all 4096-dim vectors into memory at once.
+    """
+    from torch.utils.data import DataLoader, Subset
+    from sklearn.model_selection import train_test_split
+
+    log.info("=" * 70)
+    log.info("Track 2: Streaming NN pipeline (full 4096-dim, no PCA)")
+    log.info("=" * 70)
+
+    layer_indices = [None] if task == "cross-layer" else None
+
+    if task == "per-layer":
+        # Discover available layers from first file
+        import pyarrow.parquet as pq
+        p = Path(data_dir)
+        first_file = sorted(p.glob("*.parquet"))[0]
+        table = pq.read_table(first_file, columns=["layer_index"])
+        layer_indices = sorted(set(table.column("layer_index").to_pylist()))
+        del table
+        log.info("Found layers: %s", layer_indices)
+
+    all_metrics: list[dict] = []
+
+    for layer_idx in layer_indices:
+        tag = "cross_layer" if layer_idx is None else f"layer_{layer_idx}"
+        log.info("--- Streaming NN: %s ---", tag)
+
+        dataset = CachedParquetDataset(data_dir, layer_index=layer_idx)
+        labels = dataset.labels
+        n = len(dataset)
+
+        # Stratified split using indices
+        idx_tv, idx_test = train_test_split(
+            np.arange(n), test_size=test_size, random_state=seed, stratify=labels
+        )
+        relative_val = val_size / (1 - test_size)
+        idx_train, idx_val = train_test_split(
+            idx_tv, test_size=relative_val, random_state=seed, stratify=labels[idx_tv]
+        )
+        log.info("Split — train: %d  val: %d  test: %d", len(idx_train), len(idx_val), len(idx_test))
+
+        train_ds = Subset(dataset, idx_train)
+        val_ds = Subset(dataset, idx_val)
+        test_ds = Subset(dataset, idx_test)
+
+        bs = nn_kwargs.get("batch_size", 512)
+        train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=2, pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=2, pin_memory=True)
+        test_loader = DataLoader(test_ds, batch_size=bs, shuffle=False, num_workers=2, pin_memory=True)
+
+        # Get class names
+        unique_labels = sorted(set(labels.tolist()))
+        class_names = [LABEL_MAP[i] for i in unique_labels]
+
+        nn_clfs = build_nn_classifiers(**nn_kwargs)
+        out_dir = results_dir / tag if task == "per-layer" else results_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for i, (name, clf) in enumerate(nn_clfs, 1):
+            log.info("Training %s (%d/%d) [%s, streaming] …", name, i, len(nn_clfs), tag)
+            t0 = time.time()
+            clf.fit_streaming(train_loader, val_loader)
+            elapsed = time.time() - t0
+            log.info("%s trained in %.1f s", name, elapsed)
+
+            # Collect true labels and predictions for val and test
+            y_val_true = labels[idx_val]
+            y_test_true = labels[idx_test]
+            y_val_pred = clf.predict_loader(val_loader)
+            y_test_pred = clf.predict_loader(test_loader)
+
+            for split_label, y_true, y_pred in [("val", y_val_true, y_val_pred),
+                                                  ("test", y_test_true, y_test_pred)]:
+                acc = accuracy_score(y_true, y_pred)
+                f1_w = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+                f1_m = f1_score(y_true, y_pred, average="macro", zero_division=0)
+                log.info("[%s] %s — acc=%.4f  f1w=%.4f  f1m=%.4f", split_label, name, acc, f1_w, f1_m)
+                all_metrics.append({
+                    "classifier": name, "split": split_label,
+                    "accuracy": acc, "f1_weighted": f1_w, "f1_macro": f1_m,
+                    "train_time_s": elapsed, "tag": tag, "track": "nn_streaming",
+                })
+                _save_confusion_matrix(
+                    y_true, y_pred, class_names,
+                    f"{name} — {split_label} ({tag}, streaming)",
+                    out_dir / f"cm_{tag}_{name}_{split_label}_stream.png",
+                )
+
+            report = classification_report(y_test_true, y_test_pred, target_names=class_names, zero_division=0)
+            (out_dir / f"report_{tag}_{name}_test_stream.txt").write_text(report)
+            print(f"\n{'='*60}")
+            print(f"  {name} — test report ({tag}, streaming)")
+            print(f"{'='*60}")
+            print(report)
+
+    return all_metrics
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
 
-def run_classification(data_dir, task, pca_dim, val_size, test_size, seed):
-    """End-to-end classification pipeline."""
+def run_classification(data_dir, task, pca_dim, val_size, test_size, seed,
+                       sample_size=0, track="auto", nn_kwargs=None):
+    """End-to-end classification pipeline with dual-track support."""
+    if nn_kwargs is None:
+        nn_kwargs = {}
+
     log.info("="*70)
     log.info("Starting classification pipeline")
-    log.info("Task: %s | PCA: %s | Val: %.2f | Test: %.2f | Seed: %d",
-             task, pca_dim if pca_dim else "disabled", val_size, test_size, seed)
+    log.info("Task: %s | PCA: %s | Sample: %s | Track: %s | Seed: %d",
+             task, pca_dim if pca_dim else "disabled",
+             sample_size if sample_size > 0 else "all",
+             track, seed)
     log.info("="*70)
 
     results_dir = Path(data_dir) / "classify_results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    df = load_data(data_dir)
+    all_metrics: list[dict] = []
 
-    if task == "cross-layer":
-        metrics = run_cross_layer(df, pca_dim, val_size, test_size, seed, results_dir)
-    elif task == "per-layer":
-        metrics = run_per_layer(df, pca_dim, val_size, test_size, seed, results_dir)
-    else:
-        raise ValueError(f"Unknown task: {task!r}")
+    # --- Track 1: Classical ML (+ in-memory NN on sampled/PCA data) ---
+    if track in ("auto", "classical"):
+        if sample_size > 0:
+            log.info("Track 1: Stratified sampling %d records for agile baseline...", sample_size)
+            df = stratified_sample(data_dir, n_samples=sample_size, seed=seed)
+        else:
+            df = load_data(data_dir)
+
+        if task == "cross-layer":
+            metrics = run_cross_layer(df, pca_dim, val_size, test_size, seed, results_dir)
+        elif task == "per-layer":
+            metrics = run_per_layer(df, pca_dim, val_size, test_size, seed, results_dir)
+        else:
+            raise ValueError(f"Unknown task: {task!r}")
+
+        for m in metrics:
+            m["track"] = "classical"
+        all_metrics.extend(metrics)
+
+    # --- Track 2: Streaming NN (full data, no PCA) ---
+    if track in ("auto", "nn-stream"):
+        stream_metrics = run_nn_streaming(
+            data_dir, task, val_size, test_size, seed, results_dir, nn_kwargs
+        )
+        all_metrics.extend(stream_metrics)
 
     # Summary
-    summary = pd.DataFrame(metrics)
+    summary = pd.DataFrame(all_metrics)
     summary_path = results_dir / f"summary_{task}.csv"
     summary.to_csv(summary_path, index=False)
     print(f"\n{'='*60}")
@@ -478,6 +618,30 @@ def parse_classify_args(argv=None):
         "--seed", type=int, default=42,
         help="Random seed (default: 42)",
     )
+    p.add_argument(
+        "--sample", type=int, default=0,
+        help="Stratified sample size (e.g. 100000). 0 = use all data (default: 0). "
+             "Track 1 (agile baseline): use --sample 100000 for quick iteration.",
+    )
+    p.add_argument(
+        "--track", type=str, choices=["auto", "classical", "nn-stream"],
+        default="auto",
+        help="'classical': Track 1 only (PCA + traditional ML). "
+             "'nn-stream': Track 2 only (streaming PyTorch, full 4096-dim). "
+             "'auto': run both (default).",
+    )
+    p.add_argument(
+        "--nn-epochs", type=int, default=50,
+        help="Max epochs for neural network training (default: 50)",
+    )
+    p.add_argument(
+        "--nn-batch-size", type=int, default=512,
+        help="Batch size for neural network training (default: 512)",
+    )
+    p.add_argument(
+        "--nn-lr", type=float, default=1e-3,
+        help="Learning rate for neural networks (default: 1e-3)",
+    )
     args = p.parse_args(argv)
     if args.pca_dim == 0:
         args.pca_dim = None
@@ -488,8 +652,14 @@ def main(argv=None):
     args = parse_classify_args(argv)
 
     # Setup logging with file output
-    log_dir = Path(args.data_dir) / "logs"
+    log_dir = Path(__file__).parent.parent / "logs"
     setup_logging(str(log_dir))
+
+    nn_kwargs = {
+        "epochs": args.nn_epochs,
+        "batch_size": args.nn_batch_size,
+        "lr": args.nn_lr,
+    }
 
     run_classification(
         data_dir=args.data_dir,
@@ -498,6 +668,9 @@ def main(argv=None):
         val_size=args.val_size,
         test_size=args.test_size,
         seed=args.seed,
+        sample_size=args.sample,
+        track=args.track,
+        nn_kwargs=nn_kwargs,
     )
 
 
