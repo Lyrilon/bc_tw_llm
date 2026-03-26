@@ -149,7 +149,7 @@ def _build_classifiers(n_classes: int) -> list[tuple[str, object]]:
     clfs: list[tuple[str, object]] = [
         ("LogisticRegression", make_pipeline(
             StandardScaler(),
-            LogisticRegression(max_iter=1000, multi_class="multinomial", n_jobs=-1),
+            LogisticRegression(max_iter=1000, n_jobs=-1),
         )),
         ("RandomForest", RandomForestClassifier(
             n_estimators=200, n_jobs=-1, random_state=42,
