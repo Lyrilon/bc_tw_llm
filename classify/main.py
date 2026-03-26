@@ -19,11 +19,13 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+import joblib
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import matplotlib
+import torch
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -208,6 +210,49 @@ def _save_confusion_matrix(y_true, y_pred, class_names, title, out_path):
     plt.close(fig)
 
 
+# Models directory (project root / models)
+MODELS_DIR = Path(__file__).parent.parent / "models"
+
+
+def _save_best_model(clf, name: str, tag: str, f1: float, is_nn: bool):
+    """Save model weights if it's the best test F1 for this tag.
+
+    Saves to models/{tag}/best_model.* with a metadata JSON.
+    Only overwrites if f1 > previous best.
+    """
+    import json
+
+    tag_dir = MODELS_DIR / tag
+    tag_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = tag_dir / "best_meta.json"
+
+    # Check if current best exists
+    if meta_path.exists():
+        prev = json.loads(meta_path.read_text())
+        if prev.get("f1_weighted", 0) >= f1:
+            return False  # not better
+
+    # Save model
+    if is_nn:
+        model_path = tag_dir / "best_model.pt"
+        torch.save(clf.model.state_dict(), model_path)
+    else:
+        model_path = tag_dir / "best_model.joblib"
+        joblib.dump(clf, model_path)
+
+    # Save metadata
+    meta = {
+        "classifier": name,
+        "tag": tag,
+        "f1_weighted": f1,
+        "model_file": model_path.name,
+        "is_nn": is_nn,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2))
+    ctx.step(f"★ Best model saved → {model_path.relative_to(MODELS_DIR.parent)}")
+    return True
+
+
 def _run_classifiers(
     X_train_pca, X_val_pca, X_test_pca,
     X_train_raw, X_val_raw, X_test_raw,
@@ -254,7 +299,9 @@ def _run_classifiers(
                 m_test["train_time_s"] = elapsed
                 m_test["tag"] = tag
                 all_metrics.append(m_test)
-                ctx.step(f"Test: acc={m_test['accuracy']:.4f}  F1w={m_test['f1_weighted']:.4f}  F1m={m_test['f1_macro']:.4f}", last=True)
+                ctx.step(f"Test: acc={m_test['accuracy']:.4f}  F1w={m_test['f1_weighted']:.4f}  F1m={m_test['f1_macro']:.4f}")
+
+                _save_best_model(clf, name, tag, m_test["f1_weighted"], is_nn=False)
 
                 _save_confusion_matrix(
                     y_test, y_pred_test, class_names,
@@ -292,7 +339,9 @@ def _run_classifiers(
                     m_test["train_time_s"] = elapsed
                     m_test["tag"] = tag
                     all_metrics.append(m_test)
-                    ctx.step(f"Test: acc={m_test['accuracy']:.4f}  F1w={m_test['f1_weighted']:.4f}  F1m={m_test['f1_macro']:.4f}", last=True)
+                    ctx.step(f"Test: acc={m_test['accuracy']:.4f}  F1w={m_test['f1_weighted']:.4f}  F1m={m_test['f1_macro']:.4f}")
+
+                    _save_best_model(clf, name, tag, m_test["f1_weighted"], is_nn=True)
 
                     _save_confusion_matrix(
                         y_test, y_pred_test, class_names,
@@ -512,6 +561,10 @@ def run_nn_streaming(data_dir: str, task: str, val_size: float, test_size: float
 
                         report = classification_report(y_test_true, y_test_pred, target_names=class_names, zero_division=0)
                         (out_dir / f"report_{tag}_{name}_test_stream.txt").write_text(report)
+
+                        # Save best model for this tag
+                        test_f1w = f1_score(y_test_true, y_test_pred, average="weighted", zero_division=0)
+                        _save_best_model(clf, name, f"{tag}_stream", test_f1w, is_nn=True)
 
     return all_metrics
 
