@@ -78,46 +78,54 @@ def load_data(data_dir: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def _extract_X_y(df: pd.DataFrame, pca_dim: int | None, batch_size: int = 10000):
+def _extract_X_y(df: pd.DataFrame, pca_dim: int | None, batch_size: int = 50000):
     """Extract feature matrix and threat labels. Returns (X, y, class_names, pca)."""
-    log.info("Stacking %d hidden state vectors...", len(df))
-    X_raw = np.vstack(df["hidden_state_vector"].values).astype(np.float32)
     y = df["label"].values
     class_names = [LABEL_MAP[i] for i in sorted(df["label"].unique())]
-    log.info("Feature matrix shape: %s", X_raw.shape)
+    n_samples = len(df)
+
+    try:
+        from tqdm import tqdm
+        use_tqdm = True
+    except ImportError:
+        use_tqdm = False
+        log.warning("tqdm not installed, running without progress bar")
 
     pca = None
-    if pca_dim is not None and pca_dim < X_raw.shape[1]:
-        log.info("Running IncrementalPCA: %d → %d dims", X_raw.shape[1], pca_dim)
+    if pca_dim is not None:
+        # Streaming PCA fit
+        log.info("Running streaming IncrementalPCA fit on %d samples...", n_samples)
         pca = IncrementalPCA(n_components=pca_dim)
 
-        n_samples = X_raw.shape[0]
-        try:
-            from tqdm import tqdm
+        iterator = tqdm(range(0, n_samples, batch_size), desc="PCA fitting") if use_tqdm else range(0, n_samples, batch_size)
+        for i in iterator:
+            end = min(i + batch_size, n_samples)
+            X_batch = np.vstack(df["hidden_state_vector"].values[i:end]).astype(np.float32)
+            pca.partial_fit(X_batch)
+            del X_batch
 
-            for i in tqdm(range(0, n_samples, batch_size), desc="PCA fitting"):
-                end = min(i + batch_size, n_samples)
-                pca.partial_fit(X_raw[i:end])
+        log.info("PCA fit complete! Explained variance: %.2f%%", pca.explained_variance_ratio_.sum() * 100)
 
-            X = np.zeros((n_samples, pca_dim), dtype=np.float32)
-            for i in tqdm(range(0, n_samples, batch_size), desc="PCA transform"):
-                end = min(i + batch_size, n_samples)
-                X[i:end] = pca.transform(X_raw[i:end])
-        except ImportError:
-            log.warning("tqdm not installed, running without progress bar")
-            for i in range(0, n_samples, batch_size):
-                end = min(i + batch_size, n_samples)
-                pca.partial_fit(X_raw[i:end])
-
-            X = np.zeros((n_samples, pca_dim), dtype=np.float32)
-            for i in range(0, n_samples, batch_size):
-                end = min(i + batch_size, n_samples)
-                X[i:end] = pca.transform(X_raw[i:end])
-
-        log.info("PCA complete! Explained variance: %.2f%%", pca.explained_variance_ratio_.sum() * 100)
+        # Streaming transform
+        log.info("Running streaming PCA transform...")
+        X = np.zeros((n_samples, pca_dim), dtype=np.float32)
+        iterator = tqdm(range(0, n_samples, batch_size), desc="PCA transform") if use_tqdm else range(0, n_samples, batch_size)
+        for i in iterator:
+            end = min(i + batch_size, n_samples)
+            X_batch = np.vstack(df["hidden_state_vector"].values[i:end]).astype(np.float32)
+            X[i:end] = pca.transform(X_batch)
+            del X_batch
     else:
-        X = X_raw
+        # No PCA: still use streaming to avoid memory spike
+        log.info("Stacking %d vectors (no PCA, streaming)...", n_samples)
+        vec_dim = len(df["hidden_state_vector"].iloc[0])
+        X = np.zeros((n_samples, vec_dim), dtype=np.float32)
+        iterator = tqdm(range(0, n_samples, batch_size), desc="Stacking") if use_tqdm else range(0, n_samples, batch_size)
+        for i in iterator:
+            end = min(i + batch_size, n_samples)
+            X[i:end] = np.vstack(df["hidden_state_vector"].values[i:end]).astype(np.float32)
 
+    log.info("Feature matrix shape: %s", X.shape)
     return X, y, class_names, pca
 
 
