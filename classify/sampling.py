@@ -34,9 +34,9 @@ def stratified_sample(data_dir: str, n_samples: int = 100000, seed: int = 42) ->
         return df
 
     # Stratified sampling by label
-    sampled = df.groupby("label", group_keys=False).apply(
-        lambda x: x.sample(frac=n_samples/total, random_state=seed)
-    ).reset_index(drop=True)
+    frac = n_samples / total
+    parts = [group.sample(frac=frac, random_state=seed) for _, group in df.groupby("label")]
+    sampled = pd.concat(parts).sample(frac=1, random_state=seed).reset_index(drop=True)
 
     log.info("Sampled %d records (%.1f%% of total)", len(sampled), 100 * len(sampled) / total)
     log.info("Label distribution: %s", dict(sampled["label"].value_counts().sort_index()))
