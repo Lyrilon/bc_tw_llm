@@ -28,7 +28,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.decomposition import PCA
+from sklearn.decomposition import IncrementalPCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -44,8 +44,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 from .nn_models import build_nn_classifiers
+from .logging_setup import setup_logging
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("classify")
 
 # Threat label definitions (mirrors threat_dataset.config.LABEL_MAP)
 LABEL_MAP: dict[int, str] = {
@@ -77,18 +78,45 @@ def load_data(data_dir: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def _extract_X_y(df: pd.DataFrame, pca_dim: int | None):
+def _extract_X_y(df: pd.DataFrame, pca_dim: int | None, batch_size: int = 10000):
     """Extract feature matrix and threat labels. Returns (X, y, class_names, pca)."""
-    X = np.vstack(df["hidden_state_vector"].values)
+    log.info("Stacking %d hidden state vectors...", len(df))
+    X_raw = np.vstack(df["hidden_state_vector"].values).astype(np.float32)
     y = df["label"].values
     class_names = [LABEL_MAP[i] for i in sorted(df["label"].unique())]
+    log.info("Feature matrix shape: %s", X_raw.shape)
 
     pca = None
-    if pca_dim is not None and pca_dim < X.shape[1]:
-        log.info("PCA: %d → %d dims", X.shape[1], pca_dim)
-        pca = PCA(n_components=pca_dim, random_state=42)
-        X = pca.fit_transform(X)
-        log.info("PCA explained variance: %.2f%%", pca.explained_variance_ratio_.sum() * 100)
+    if pca_dim is not None and pca_dim < X_raw.shape[1]:
+        log.info("Running IncrementalPCA: %d → %d dims", X_raw.shape[1], pca_dim)
+        pca = IncrementalPCA(n_components=pca_dim)
+
+        n_samples = X_raw.shape[0]
+        try:
+            from tqdm import tqdm
+
+            for i in tqdm(range(0, n_samples, batch_size), desc="PCA fitting"):
+                end = min(i + batch_size, n_samples)
+                pca.partial_fit(X_raw[i:end])
+
+            X = np.zeros((n_samples, pca_dim), dtype=np.float32)
+            for i in tqdm(range(0, n_samples, batch_size), desc="PCA transform"):
+                end = min(i + batch_size, n_samples)
+                X[i:end] = pca.transform(X_raw[i:end])
+        except ImportError:
+            log.warning("tqdm not installed, running without progress bar")
+            for i in range(0, n_samples, batch_size):
+                end = min(i + batch_size, n_samples)
+                pca.partial_fit(X_raw[i:end])
+
+            X = np.zeros((n_samples, pca_dim), dtype=np.float32)
+            for i in range(0, n_samples, batch_size):
+                end = min(i + batch_size, n_samples)
+                X[i:end] = pca.transform(X_raw[i:end])
+
+        log.info("PCA complete! Explained variance: %.2f%%", pca.explained_variance_ratio_.sum() * 100)
+    else:
+        X = X_raw
 
     return X, y, class_names, pca
 
@@ -449,8 +477,12 @@ def parse_classify_args(argv=None):
 
 
 def main(argv=None):
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     args = parse_classify_args(argv)
+
+    # Setup logging with file output
+    log_dir = Path(args.data_dir) / "logs"
+    setup_logging(str(log_dir))
+
     run_classification(
         data_dir=args.data_dir,
         task=args.task,
