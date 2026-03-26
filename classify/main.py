@@ -41,11 +41,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
 
 from .nn_models import build_nn_classifiers, NNClassifier, NN_CONFIGS, CachedParquetDataset
 from .sampling import stratified_sample
-from .logging_setup import setup_logging
+from .logging_setup import setup_logging, LogContext
 
 log = logging.getLogger("classify")
 
@@ -57,6 +56,10 @@ LABEL_MAP: dict[int, str] = {
     3: "random_noise",
     4: "adversarial_perturbation",
 }
+
+# Module-level LogContext, initialised in main()
+ctx: LogContext = LogContext()
+
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -70,7 +73,7 @@ def load_data(data_dir: str) -> pd.DataFrame:
     if not files:
         raise FileNotFoundError(f"No .parquet files found in {data_dir}")
     df = pd.read_parquet(files)
-    log.info("Loaded %d records from %d file(s) in %s", len(df), len(files), data_dir)
+    ctx.step(f"Loaded {len(df):,} records from {len(files)} files")
     return df
 
 
@@ -79,7 +82,8 @@ def load_data(data_dir: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def _extract_X_y(df: pd.DataFrame, pca_dim: int | None, batch_size: int = 50000):
+def _extract_X_y(df: pd.DataFrame, pca_dim: int | None, batch_size: int = 50000,
+                 label: str = ""):
     """Extract feature matrix and threat labels. Returns (X, y, class_names, pca)."""
     y = df["label"].values
     class_names = [LABEL_MAP[i] for i in sorted(df["label"].unique())]
@@ -90,43 +94,33 @@ def _extract_X_y(df: pd.DataFrame, pca_dim: int | None, batch_size: int = 50000)
         use_tqdm = True
     except ImportError:
         use_tqdm = False
-        log.warning("tqdm not installed, running without progress bar")
 
     pca = None
     if pca_dim is not None:
-        # Streaming PCA fit
-        log.info("Running streaming IncrementalPCA fit on %d samples...", n_samples)
         pca = IncrementalPCA(n_components=pca_dim)
 
-        iterator = tqdm(range(0, n_samples, batch_size), desc="PCA fitting") if use_tqdm else range(0, n_samples, batch_size)
+        iterator = tqdm(range(0, n_samples, batch_size), desc=f"    PCA fitting ({label})" if label else "    PCA fitting", leave=False) if use_tqdm else range(0, n_samples, batch_size)
         for i in iterator:
             end = min(i + batch_size, n_samples)
             X_batch = np.vstack(df["hidden_state_vector"].values[i:end]).astype(np.float32)
             pca.partial_fit(X_batch)
             del X_batch
 
-        log.info("PCA fit complete! Explained variance: %.2f%%", pca.explained_variance_ratio_.sum() * 100)
-
-        # Streaming transform
-        log.info("Running streaming PCA transform...")
         X = np.zeros((n_samples, pca_dim), dtype=np.float32)
-        iterator = tqdm(range(0, n_samples, batch_size), desc="PCA transform") if use_tqdm else range(0, n_samples, batch_size)
+        iterator = tqdm(range(0, n_samples, batch_size), desc=f"    PCA transform ({label})" if label else "    PCA transform", leave=False) if use_tqdm else range(0, n_samples, batch_size)
         for i in iterator:
             end = min(i + batch_size, n_samples)
             X_batch = np.vstack(df["hidden_state_vector"].values[i:end]).astype(np.float32)
             X[i:end] = pca.transform(X_batch)
             del X_batch
     else:
-        # No PCA: still use streaming to avoid memory spike
-        log.info("Stacking %d vectors (no PCA, streaming)...", n_samples)
         vec_dim = len(df["hidden_state_vector"].iloc[0])
         X = np.zeros((n_samples, vec_dim), dtype=np.float32)
-        iterator = tqdm(range(0, n_samples, batch_size), desc="Stacking") if use_tqdm else range(0, n_samples, batch_size)
+        iterator = tqdm(range(0, n_samples, batch_size), desc=f"    Stacking ({label})" if label else "    Stacking", leave=False) if use_tqdm else range(0, n_samples, batch_size)
         for i in iterator:
             end = min(i + batch_size, n_samples)
             X[i:end] = np.vstack(df["hidden_state_vector"].values[i:end]).astype(np.float32)
 
-    log.info("Feature matrix shape: %s", X.shape)
     return X, y, class_names, pca
 
 
@@ -144,7 +138,6 @@ def _split(X, y, val_size: float, test_size: float, seed: int):
     X_train, X_val, y_train, y_val = train_test_split(
         X_tv, y_tv, test_size=relative_val, random_state=seed, stratify=y_tv,
     )
-    log.info("Split — train: %d  val: %d  test: %d", len(y_train), len(y_val), len(y_test))
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 
@@ -177,7 +170,7 @@ def _build_classifiers(n_classes: int) -> list[tuple[str, object]]:
             n_jobs=-1, random_state=42, verbose=-1,
         )))
     except ImportError:
-        log.warning("lightgbm not installed — skipping LightGBM classifier")
+        pass  # silently skip, will note in classifier count
 
     return clfs
 
@@ -193,7 +186,6 @@ def _evaluate(name, clf, X, y, class_names, split_label):
     acc = accuracy_score(y, y_pred)
     f1_w = f1_score(y, y_pred, average="weighted", zero_division=0)
     f1_m = f1_score(y, y_pred, average="macro", zero_division=0)
-    log.info("[%s] %s — acc=%.4f  f1w=%.4f  f1m=%.4f", split_label, name, acc, f1_w, f1_m)
     return {
         "classifier": name,
         "split": split_label,
@@ -214,7 +206,6 @@ def _save_confusion_matrix(y_true, y_pred, class_names, title, out_path):
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    log.info("Saved confusion matrix → %s", out_path)
 
 
 def _run_classifiers(
@@ -223,94 +214,94 @@ def _run_classifiers(
     y_train, y_val, y_test,
     class_names, results_dir: Path, tag: str,
 ):
-    """Train all classifiers, evaluate, save artifacts. Return metrics list.
-
-    Classical ML uses PCA-reduced data; Neural Networks use raw high-dim data.
-    """
+    """Train all classifiers, evaluate, save artifacts. Return metrics list."""
     n_classes = len(class_names)
     all_metrics: list[dict] = []
 
     # --- Classical ML classifiers (use PCA data) ---
     classical_clfs = _build_classifiers(n_classes)
-    log.info("Starting classical ML classifiers (%d models) [%s]", len(classical_clfs), tag)
-    for i, (name, clf) in enumerate(classical_clfs, 1):
-        log.info("Training %s (%d/%d, PCA dim=%d) [%s] …", name, i, len(classical_clfs), X_train_pca.shape[1], tag)
-        t0 = time.time()
-        clf.fit(X_train_pca, y_train)
-        elapsed = time.time() - t0
-        log.info("%s trained in %.1f s", name, elapsed)
-
-        # --- val ---
-        log.info("Evaluating %s on validation set...", name)
-        m_val, y_pred_val = _evaluate(name, clf, X_val_pca, y_val, class_names, "val")
-        m_val["train_time_s"] = elapsed
-        m_val["tag"] = tag
-        all_metrics.append(m_val)
-        _save_confusion_matrix(
-            y_val, y_pred_val, class_names,
-            f"{name} — val ({tag})",
-            results_dir / f"cm_{tag}_{name}_val.png",
-        )
-
-        # --- test ---
-        log.info("Evaluating %s on test set...", name)
-        m_test, y_pred_test = _evaluate(name, clf, X_test_pca, y_test, class_names, "test")
-        m_test["train_time_s"] = elapsed
-        m_test["tag"] = tag
-        all_metrics.append(m_test)
-        _save_confusion_matrix(
-            y_test, y_pred_test, class_names,
-            f"{name} — test ({tag})",
-            results_dir / f"cm_{tag}_{name}_test.png",
-        )
-
-        report = classification_report(y_test, y_pred_test, target_names=class_names, zero_division=0)
-        (results_dir / f"report_{tag}_{name}_test.txt").write_text(report)
-        print(f"\n{'='*60}")
-        print(f"  {name} — test report ({tag})")
-        print(f"{'='*60}")
-        print(report)
+    n_classical = len(classical_clfs)
 
     # --- Neural Network classifiers (use RAW data, NO PCA) ---
     nn_clfs = build_nn_classifiers()
-    log.info("Starting neural network classifiers (%d models) [%s]", len(nn_clfs), tag)
-    for i, (name, clf) in enumerate(nn_clfs, 1):
-        log.info("Training %s (%d/%d, RAW dim=%d, NO PCA) [%s] …", name, i, len(nn_clfs), X_train_raw.shape[1], tag)
-        t0 = time.time()
-        clf.fit(X_train_raw, y_train, X_val_raw, y_val)
-        elapsed = time.time() - t0
-        log.info("%s trained in %.1f s", name, elapsed)
+    n_nn = len(nn_clfs)
 
-        # --- val ---
-        log.info("Evaluating %s on validation set...", name)
-        m_val, y_pred_val = _evaluate(name, clf, X_val_raw, y_val, class_names, "val")
-        m_val["train_time_s"] = elapsed
-        m_val["tag"] = tag
-        all_metrics.append(m_val)
-        _save_confusion_matrix(
-            y_val, y_pred_val, class_names,
-            f"{name} — val ({tag})",
-            results_dir / f"cm_{tag}_{name}_val.png",
-        )
+    # -- Classical ML --
+    is_last_classical_group = (n_nn == 0)
+    with ctx.group(f"Classical ML ({n_classical} models, PCA {X_train_pca.shape[1]}-dim)",
+                   last=is_last_classical_group):
+        for i, (name, clf) in enumerate(classical_clfs, 1):
+            is_last_clf = (i == n_classical)
+            with ctx.group(f"[{i}/{n_classical}] {name}", last=is_last_clf):
+                t0 = time.time()
+                clf.fit(X_train_pca, y_train)
+                elapsed = time.time() - t0
+                ctx.step(f"Training...done ({elapsed:.1f}s)")
 
-        # --- test ---
-        log.info("Evaluating %s on test set...", name)
-        m_test, y_pred_test = _evaluate(name, clf, X_test_raw, y_test, class_names, "test")
-        m_test["train_time_s"] = elapsed
-        m_test["tag"] = tag
-        all_metrics.append(m_test)
-        _save_confusion_matrix(
-            y_test, y_pred_test, class_names,
-            f"{name} — test ({tag})",
-            results_dir / f"cm_{tag}_{name}_test.png",
-        )
+                m_val, y_pred_val = _evaluate(name, clf, X_val_pca, y_val, class_names, "val")
+                m_val["train_time_s"] = elapsed
+                m_val["tag"] = tag
+                all_metrics.append(m_val)
+                ctx.step(f"Val:  acc={m_val['accuracy']:.4f}  F1w={m_val['f1_weighted']:.4f}  F1m={m_val['f1_macro']:.4f}")
 
-        report = classification_report(y_test, y_pred_test, target_names=class_names, zero_division=0)
-        (results_dir / f"report_{tag}_{name}_test.txt").write_text(report)
-        print(f"\n{'='*60}")
-        print(f"  {name} — test report ({tag})")
-        print(f"{'='*60}")
-        print(report)
+                _save_confusion_matrix(
+                    y_val, y_pred_val, class_names,
+                    f"{name} — val ({tag})",
+                    results_dir / f"cm_{tag}_{name}_val.png",
+                )
+
+                m_test, y_pred_test = _evaluate(name, clf, X_test_pca, y_test, class_names, "test")
+                m_test["train_time_s"] = elapsed
+                m_test["tag"] = tag
+                all_metrics.append(m_test)
+                ctx.step(f"Test: acc={m_test['accuracy']:.4f}  F1w={m_test['f1_weighted']:.4f}  F1m={m_test['f1_macro']:.4f}", last=True)
+
+                _save_confusion_matrix(
+                    y_test, y_pred_test, class_names,
+                    f"{name} — test ({tag})",
+                    results_dir / f"cm_{tag}_{name}_test.png",
+                )
+
+                report = classification_report(y_test, y_pred_test, target_names=class_names, zero_division=0)
+                (results_dir / f"report_{tag}_{name}_test.txt").write_text(report)
+
+    # -- Neural Networks --
+    if n_nn > 0:
+        with ctx.group(f"Neural Networks ({n_nn} models, RAW {X_train_raw.shape[1]}-dim)", last=True):
+            for i, (name, clf) in enumerate(nn_clfs, 1):
+                is_last_nn = (i == n_nn)
+                with ctx.group(f"[{i}/{n_nn}] {name}", last=is_last_nn):
+                    t0 = time.time()
+                    clf.fit(X_train_raw, y_train, X_val_raw, y_val)
+                    elapsed = time.time() - t0
+                    ctx.step(f"Training...done ({elapsed:.1f}s)")
+
+                    m_val, y_pred_val = _evaluate(name, clf, X_val_raw, y_val, class_names, "val")
+                    m_val["train_time_s"] = elapsed
+                    m_val["tag"] = tag
+                    all_metrics.append(m_val)
+                    ctx.step(f"Val:  acc={m_val['accuracy']:.4f}  F1w={m_val['f1_weighted']:.4f}  F1m={m_val['f1_macro']:.4f}")
+
+                    _save_confusion_matrix(
+                        y_val, y_pred_val, class_names,
+                        f"{name} — val ({tag})",
+                        results_dir / f"cm_{tag}_{name}_val.png",
+                    )
+
+                    m_test, y_pred_test = _evaluate(name, clf, X_test_raw, y_test, class_names, "test")
+                    m_test["train_time_s"] = elapsed
+                    m_test["tag"] = tag
+                    all_metrics.append(m_test)
+                    ctx.step(f"Test: acc={m_test['accuracy']:.4f}  F1w={m_test['f1_weighted']:.4f}  F1m={m_test['f1_macro']:.4f}", last=True)
+
+                    _save_confusion_matrix(
+                        y_test, y_pred_test, class_names,
+                        f"{name} — test ({tag})",
+                        results_dir / f"cm_{tag}_{name}_test.png",
+                    )
+
+                    report = classification_report(y_test, y_pred_test, target_names=class_names, zero_division=0)
+                    (results_dir / f"report_{tag}_{name}_test.txt").write_text(report)
 
     return all_metrics
 
@@ -322,19 +313,21 @@ def _run_classifiers(
 
 def run_cross_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, results_dir):
     """Single classifier trained on all layers mixed together."""
-    log.info("=== Task: cross-layer (one model, all layers) ===")
 
-    # Extract BOTH raw and PCA features
-    log.info("Extracting raw features (for neural networks)...")
-    X_raw, y, class_names, _ = _extract_X_y(df, pca_dim=None)  # NO PCA for neural networks
-    log.info("Extracting PCA features (for classical ML)...")
-    X_pca, _, _, _ = _extract_X_y(df, pca_dim=pca_dim)        # PCA for classical ML
+    # Feature extraction
+    with ctx.group("Feature extraction"):
+        t0 = time.time()
+        X_raw, y, class_names, _ = _extract_X_y(df, pca_dim=None, label="raw")
+        elapsed_raw = time.time() - t0
+        ctx.step(f"Raw features: {X_raw.shape[0]:,} x {X_raw.shape[1]:,} ({elapsed_raw:.1f}s)")
 
-    log.info("Total samples: %d  raw_features: %d  pca_features: %d  classes: %d",
-             len(y), X_raw.shape[1], X_pca.shape[1], len(class_names))
+        t0 = time.time()
+        X_pca, _, _, pca_obj = _extract_X_y(df, pca_dim=pca_dim, label="pca")
+        elapsed_pca = time.time() - t0
+        variance = pca_obj.explained_variance_ratio_.sum() * 100 if pca_obj else 0
+        ctx.step(f"PCA features: {X_pca.shape[0]:,} x {X_pca.shape[1]:,} (variance: {variance:.1f}%, {elapsed_pca:.1f}s)", last=True)
 
-    # Split once using indices, then apply to both matrices
-    log.info("Splitting data into train/val/test sets...")
+    # Split
     idx_tv, idx_test = train_test_split(
         np.arange(len(y)), test_size=test_size, random_state=seed, stratify=y
     )
@@ -347,9 +340,8 @@ def run_cross_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, result
     X_train_pca, X_val_pca, X_test_pca = X_pca[idx_train], X_pca[idx_val], X_pca[idx_test]
     y_train, y_val, y_test = y[idx_train], y[idx_val], y[idx_test]
 
-    log.info("Split — train: %d  val: %d  test: %d", len(y_train), len(y_val), len(y_test))
+    ctx.step(f"Data split: train={len(y_train):,} / val={len(y_val):,} / test={len(y_test):,}")
 
-    log.info("Starting classifier training and evaluation...")
     return _run_classifiers(
         X_train_pca, X_val_pca, X_test_pca,
         X_train_raw, X_val_raw, X_test_raw,
@@ -365,47 +357,56 @@ def run_cross_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, result
 
 def run_per_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, results_dir):
     """One classifier per decoder layer, each only sees its own layer's data."""
-    log.info("=== Task: per-layer (one model per layer) ===")
     layers = sorted(df["layer_index"].unique())
-    log.info("Found %d layers: %s", len(layers), layers)
+    n_layers = len(layers)
+    ctx.step(f"Found {n_layers} decoder layers")
 
     all_metrics: list[dict] = []
 
-    for i, layer_idx in enumerate(layers, 1):
+    for li, layer_idx in enumerate(layers, 1):
         layer_df = df[df["layer_index"] == layer_idx]
         tag = f"layer_{layer_idx}"
-        log.info("--- Processing layer %d/%d (layer_index=%d): %d samples ---",
-                 i, len(layers), layer_idx, len(layer_df))
+        is_last_layer = (li == n_layers)
 
-        # Extract BOTH raw and PCA features
-        log.info("Extracting features for layer %d...", layer_idx)
-        X_raw, y, class_names, _ = _extract_X_y(layer_df, pca_dim=None)  # NO PCA for neural networks
-        X_pca, _, _, _ = _extract_X_y(layer_df, pca_dim=pca_dim)        # PCA for classical ML
+        with ctx.group(f"[{li}/{n_layers}] Layer {layer_idx} ({len(layer_df):,} samples)",
+                       last=is_last_layer):
+            # Extract features
+            with ctx.group("Feature extraction"):
+                t0 = time.time()
+                X_raw, y, class_names, _ = _extract_X_y(layer_df, pca_dim=None, label=f"L{layer_idx} raw")
+                elapsed_raw = time.time() - t0
+                ctx.step(f"Raw: {X_raw.shape[0]:,} x {X_raw.shape[1]:,} ({elapsed_raw:.1f}s)")
 
-        # Skip if too few samples per class for stratified split
-        unique, counts = np.unique(y, return_counts=True)
-        if counts.min() < 3:
-            log.warning("Layer %d: too few samples (min class=%d), skipping", layer_idx, counts.min())
-            continue
+                t0 = time.time()
+                X_pca, _, _, pca_obj = _extract_X_y(layer_df, pca_dim=pca_dim, label=f"L{layer_idx} pca")
+                elapsed_pca = time.time() - t0
+                variance = pca_obj.explained_variance_ratio_.sum() * 100 if pca_obj else 0
+                ctx.step(f"PCA: {X_pca.shape[0]:,} x {X_pca.shape[1]:,} (variance: {variance:.1f}%, {elapsed_pca:.1f}s)", last=True)
 
-        # Use the same stratified split for both
-        log.info("Splitting data for layer %d...", layer_idx)
-        splits_raw = _split(X_raw, y, val_size, test_size, seed)
-        splits_pca = _split(X_pca, y, val_size, test_size, seed)
+            # Skip if too few
+            unique, counts = np.unique(y, return_counts=True)
+            if counts.min() < 3:
+                ctx.step(f"Skipped: too few samples (min class={counts.min()})", last=True)
+                continue
 
-        X_train_raw, X_val_raw, X_test_raw, y_train, y_val, y_test = splits_raw
-        X_train_pca, X_val_pca, X_test_pca, _, _, _ = splits_pca
+            # Split
+            splits_raw = _split(X_raw, y, val_size, test_size, seed)
+            splits_pca = _split(X_pca, y, val_size, test_size, seed)
+            X_train_raw, X_val_raw, X_test_raw, y_train, y_val, y_test = splits_raw
+            X_train_pca, X_val_pca, X_test_pca, _, _, _ = splits_pca
 
-        layer_dir = results_dir / tag
-        layer_dir.mkdir(parents=True, exist_ok=True)
-        log.info("Training classifiers for layer %d...", layer_idx)
-        metrics = _run_classifiers(
-            X_train_pca, X_val_pca, X_test_pca,
-            X_train_raw, X_val_raw, X_test_raw,
-            y_train, y_val, y_test,
-            class_names, layer_dir, tag=tag
-        )
-        all_metrics.extend(metrics)
+            ctx.step(f"Data split: train={len(y_train):,} / val={len(y_val):,} / test={len(y_test):,}")
+
+            layer_dir = results_dir / tag
+            layer_dir.mkdir(parents=True, exist_ok=True)
+
+            metrics = _run_classifiers(
+                X_train_pca, X_val_pca, X_test_pca,
+                X_train_raw, X_val_raw, X_test_raw,
+                y_train, y_val, y_test,
+                class_names, layer_dir, tag=tag
+            )
+            all_metrics.extend(metrics)
 
     return all_metrics
 
@@ -417,102 +418,100 @@ def run_per_layer(df: pd.DataFrame, pca_dim, val_size, test_size, seed, results_
 
 def run_nn_streaming(data_dir: str, task: str, val_size: float, test_size: float,
                      seed: int, results_dir: Path, nn_kwargs: dict):
-    """Train neural networks on full-resolution data via streaming DataLoaders.
-
-    This avoids loading all 4096-dim vectors into memory at once.
-    """
+    """Train neural networks on full-resolution data via streaming DataLoaders."""
     from torch.utils.data import DataLoader, Subset
     from sklearn.model_selection import train_test_split
-
-    log.info("=" * 70)
-    log.info("Track 2: Streaming NN pipeline (full 4096-dim, no PCA)")
-    log.info("=" * 70)
 
     layer_indices = [None] if task == "cross-layer" else None
 
     if task == "per-layer":
-        # Discover available layers from first file
         import pyarrow.parquet as pq
         p = Path(data_dir)
         first_file = sorted(p.glob("*.parquet"))[0]
         table = pq.read_table(first_file, columns=["layer_index"])
         layer_indices = sorted(set(table.column("layer_index").to_pylist()))
         del table
-        log.info("Found layers: %s", layer_indices)
+        ctx.step(f"Found {len(layer_indices)} layers for streaming")
 
     all_metrics: list[dict] = []
+    n_groups = len(layer_indices)
 
-    for layer_idx in layer_indices:
+    for gi, layer_idx in enumerate(layer_indices, 1):
         tag = "cross_layer" if layer_idx is None else f"layer_{layer_idx}"
-        log.info("--- Streaming NN: %s ---", tag)
+        is_last_group = (gi == n_groups)
+        group_title = "All layers (cross-layer)" if layer_idx is None else f"[{gi}/{n_groups}] Layer {layer_idx}"
 
-        dataset = CachedParquetDataset(data_dir, layer_index=layer_idx)
-        labels = dataset.labels
-        n = len(dataset)
-
-        # Stratified split using indices
-        idx_tv, idx_test = train_test_split(
-            np.arange(n), test_size=test_size, random_state=seed, stratify=labels
-        )
-        relative_val = val_size / (1 - test_size)
-        idx_train, idx_val = train_test_split(
-            idx_tv, test_size=relative_val, random_state=seed, stratify=labels[idx_tv]
-        )
-        log.info("Split — train: %d  val: %d  test: %d", len(idx_train), len(idx_val), len(idx_test))
-
-        train_ds = Subset(dataset, idx_train)
-        val_ds = Subset(dataset, idx_val)
-        test_ds = Subset(dataset, idx_test)
-
-        bs = nn_kwargs.get("batch_size", 512)
-        train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=2, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=2, pin_memory=True)
-        test_loader = DataLoader(test_ds, batch_size=bs, shuffle=False, num_workers=2, pin_memory=True)
-
-        # Get class names
-        unique_labels = sorted(set(labels.tolist()))
-        class_names = [LABEL_MAP[i] for i in unique_labels]
-
-        nn_clfs = build_nn_classifiers(**nn_kwargs)
-        out_dir = results_dir / tag if task == "per-layer" else results_dir
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        for i, (name, clf) in enumerate(nn_clfs, 1):
-            log.info("Training %s (%d/%d) [%s, streaming] …", name, i, len(nn_clfs), tag)
+        with ctx.group(group_title, last=is_last_group):
             t0 = time.time()
-            clf.fit_streaming(train_loader, val_loader)
-            elapsed = time.time() - t0
-            log.info("%s trained in %.1f s", name, elapsed)
+            dataset = CachedParquetDataset(data_dir, layer_index=layer_idx)
+            labels = dataset.labels
+            n = len(dataset)
+            elapsed_load = time.time() - t0
+            ctx.step(f"Loaded {n:,} samples, dim={dataset._vectors.shape[1]} ({elapsed_load:.1f}s)")
 
-            # Collect true labels and predictions for val and test
-            y_val_true = labels[idx_val]
-            y_test_true = labels[idx_test]
-            y_val_pred = clf.predict_loader(val_loader)
-            y_test_pred = clf.predict_loader(test_loader)
+            # Stratified split
+            idx_tv, idx_test = train_test_split(
+                np.arange(n), test_size=test_size, random_state=seed, stratify=labels
+            )
+            relative_val = val_size / (1 - test_size)
+            idx_train, idx_val = train_test_split(
+                idx_tv, test_size=relative_val, random_state=seed, stratify=labels[idx_tv]
+            )
+            ctx.step(f"Data split: train={len(idx_train):,} / val={len(idx_val):,} / test={len(idx_test):,}")
 
-            for split_label, y_true, y_pred in [("val", y_val_true, y_val_pred),
-                                                  ("test", y_test_true, y_test_pred)]:
-                acc = accuracy_score(y_true, y_pred)
-                f1_w = f1_score(y_true, y_pred, average="weighted", zero_division=0)
-                f1_m = f1_score(y_true, y_pred, average="macro", zero_division=0)
-                log.info("[%s] %s — acc=%.4f  f1w=%.4f  f1m=%.4f", split_label, name, acc, f1_w, f1_m)
-                all_metrics.append({
-                    "classifier": name, "split": split_label,
-                    "accuracy": acc, "f1_weighted": f1_w, "f1_macro": f1_m,
-                    "train_time_s": elapsed, "tag": tag, "track": "nn_streaming",
-                })
-                _save_confusion_matrix(
-                    y_true, y_pred, class_names,
-                    f"{name} — {split_label} ({tag}, streaming)",
-                    out_dir / f"cm_{tag}_{name}_{split_label}_stream.png",
-                )
+            train_ds = Subset(dataset, idx_train)
+            val_ds = Subset(dataset, idx_val)
+            test_ds = Subset(dataset, idx_test)
 
-            report = classification_report(y_test_true, y_test_pred, target_names=class_names, zero_division=0)
-            (out_dir / f"report_{tag}_{name}_test_stream.txt").write_text(report)
-            print(f"\n{'='*60}")
-            print(f"  {name} — test report ({tag}, streaming)")
-            print(f"{'='*60}")
-            print(report)
+            bs = nn_kwargs.get("batch_size", 512)
+            train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=2, pin_memory=True)
+            val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=2, pin_memory=True)
+            test_loader = DataLoader(test_ds, batch_size=bs, shuffle=False, num_workers=2, pin_memory=True)
+
+            unique_labels = sorted(set(labels.tolist()))
+            class_names = [LABEL_MAP[i] for i in unique_labels]
+
+            nn_clfs = build_nn_classifiers(**nn_kwargs)
+            out_dir = results_dir / tag if task == "per-layer" else results_dir
+            out_dir.mkdir(parents=True, exist_ok=True)
+            n_nn = len(nn_clfs)
+
+            with ctx.group(f"Neural Networks ({n_nn} models, streaming)", last=True):
+                for i, (name, clf) in enumerate(nn_clfs, 1):
+                    is_last_nn = (i == n_nn)
+                    with ctx.group(f"[{i}/{n_nn}] {name}", last=is_last_nn):
+                        t0 = time.time()
+                        clf.fit_streaming(train_loader, val_loader)
+                        elapsed = time.time() - t0
+                        ctx.step(f"Training...done ({elapsed:.1f}s)")
+
+                        y_val_true = labels[idx_val]
+                        y_test_true = labels[idx_test]
+                        y_val_pred = clf.predict_loader(val_loader)
+                        y_test_pred = clf.predict_loader(test_loader)
+
+                        for split_label, y_true, y_pred in [("val", y_val_true, y_val_pred),
+                                                              ("test", y_test_true, y_test_pred)]:
+                            acc = accuracy_score(y_true, y_pred)
+                            f1_w = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+                            f1_m = f1_score(y_true, y_pred, average="macro", zero_division=0)
+                            is_last_metric = (split_label == "test")
+                            label = "Val: " if split_label == "val" else "Test:"
+                            ctx.step(f"{label} acc={acc:.4f}  F1w={f1_w:.4f}  F1m={f1_m:.4f}",
+                                     last=is_last_metric)
+                            all_metrics.append({
+                                "classifier": name, "split": split_label,
+                                "accuracy": acc, "f1_weighted": f1_w, "f1_macro": f1_m,
+                                "train_time_s": elapsed, "tag": tag, "track": "nn_streaming",
+                            })
+                            _save_confusion_matrix(
+                                y_true, y_pred, class_names,
+                                f"{name} — {split_label} ({tag}, streaming)",
+                                out_dir / f"cm_{tag}_{name}_{split_label}_stream.png",
+                            )
+
+                        report = classification_report(y_test_true, y_test_pred, target_names=class_names, zero_division=0)
+                        (out_dir / f"report_{tag}_{name}_test_stream.txt").write_text(report)
 
     return all_metrics
 
@@ -528,26 +527,40 @@ def run_classification(data_dir, task, pca_dim, val_size, test_size, seed,
     if nn_kwargs is None:
         nn_kwargs = {}
 
-    log.info("="*70)
-    log.info("Starting classification pipeline")
-    log.info("Task: %s | PCA: %s | Sample: %s | Track: %s | Seed: %d",
-             task, pca_dim if pca_dim else "disabled",
-             sample_size if sample_size > 0 else "all",
-             track, seed)
-    log.info("="*70)
-
     results_dir = Path(data_dir) / "classify_results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
+    # Header
+    pca_str = str(pca_dim) if pca_dim else "disabled"
+    sample_str = f"{sample_size:,}" if sample_size > 0 else "all"
+    ctx.section(
+        "Classification Pipeline",
+        f"Task: {task} | PCA: {pca_str} | Sample: {sample_str} | Track: {track} | Seed: {seed}"
+    )
+
     all_metrics: list[dict] = []
+    n_tracks = sum(1 for t in ("classical", "nn-stream") if track in ("auto", t))
+    track_idx = 0
 
     # --- Track 1: Classical ML (+ in-memory NN on sampled/PCA data) ---
     if track in ("auto", "classical"):
+        track_idx += 1
+        is_last_track = (track_idx == n_tracks)
+
         if sample_size > 0:
-            log.info("Track 1: Stratified sampling %d records for agile baseline...", sample_size)
-            df = stratified_sample(data_dir, n_samples=sample_size, seed=seed)
+            ctx.phase(track_idx, n_tracks,
+                      f"Track 1: Agile Baseline ({sample_size:,} samples, PCA {pca_str}-dim)")
         else:
-            df = load_data(data_dir)
+            ctx.phase(track_idx, n_tracks,
+                      f"Track 1: Classical ML (all data, PCA {pca_str}-dim)")
+
+        with ctx.group("Data loading"):
+            if sample_size > 0:
+                df = stratified_sample(data_dir, n_samples=sample_size, seed=seed)
+                label_dist = dict(df["label"].value_counts().sort_index())
+                ctx.step(f"Sampled {len(df):,} records ({100*len(df)/1600000:.1f}%)", last=True)
+            else:
+                df = load_data(data_dir)
 
         if task == "cross-layer":
             metrics = run_cross_layer(df, pca_dim, val_size, test_size, seed, results_dir)
@@ -559,23 +572,29 @@ def run_classification(data_dir, task, pca_dim, val_size, test_size, seed,
         for m in metrics:
             m["track"] = "classical"
         all_metrics.extend(metrics)
+        ctx.blank()
 
     # --- Track 2: Streaming NN (full data, no PCA) ---
     if track in ("auto", "nn-stream"):
+        track_idx += 1
+        ctx.phase(track_idx, n_tracks,
+                  "Track 2: Streaming NN (full data, RAW 4096-dim)")
+
         stream_metrics = run_nn_streaming(
             data_dir, task, val_size, test_size, seed, results_dir, nn_kwargs
         )
         all_metrics.extend(stream_metrics)
+        ctx.blank()
 
     # Summary
     summary = pd.DataFrame(all_metrics)
     summary_path = results_dir / f"summary_{task}.csv"
     summary.to_csv(summary_path, index=False)
-    print(f"\n{'='*60}")
-    print(f"  Summary — {task}")
-    print(f"{'='*60}")
-    print(summary.to_string(index=False))
-    print(f"\nResults saved to {results_dir}")
+
+    ctx.section("Summary", task)
+    ctx.text(summary.to_string(index=False))
+    ctx.blank()
+    ctx.text(f"Results saved to {results_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -645,11 +664,16 @@ def parse_classify_args(argv=None):
 
 
 def main(argv=None):
+    global ctx
+
     args = parse_classify_args(argv)
 
     # Setup logging with file output
     log_dir = Path(__file__).parent.parent / "logs"
     setup_logging(str(log_dir))
+
+    # Initialise hierarchical log context
+    ctx = LogContext()
 
     nn_kwargs = {
         "epochs": args.nn_epochs,
