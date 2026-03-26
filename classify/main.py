@@ -163,10 +163,6 @@ def _build_classifiers(n_classes: int) -> list[tuple[str, object]]:
         ("RandomForest", RandomForestClassifier(
             n_estimators=200, n_jobs=-1, random_state=42,
         )),
-        ("SVM_RBF", make_pipeline(
-            StandardScaler(),
-            SVC(kernel="rbf", decision_function_shape="ovr"),
-        )),
         ("KNN", make_pipeline(
             StandardScaler(),
             KNeighborsClassifier(n_neighbors=5, n_jobs=-1),
